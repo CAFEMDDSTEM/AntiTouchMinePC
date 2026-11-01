@@ -1,0 +1,7 @@
+<Solution>
+  <Configurations>
+    <Platform Name="x64" />
+    <Platform Name="x86" />
+  </Configurations>
+  <Project Path="AntiTouchMinePC/AntiTouchMinePC.vcxproj" Id="e9337378-8489-4183-9725-9cf9949a4ffc" />
+</Solution>
