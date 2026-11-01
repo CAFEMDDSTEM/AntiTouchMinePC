@@ -20,7 +20,7 @@ namespace ImGuiUI {
 		float nmsThreshold = 0.45f;
 		int faceMinNeighbors = 3;
 		int captureIntervalSeconds = 5;
-		int detectionIntervalFrames = 2;
+		int detectionIntervalFrames = 1;
 	};
 
 	struct Status {

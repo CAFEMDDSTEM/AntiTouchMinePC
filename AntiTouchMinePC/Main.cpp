@@ -8,10 +8,15 @@
 #include <opencv2/videoio.hpp>
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
+#include <condition_variable>
+#include <cstdint>
 #include <filesystem>
 #include <iostream>
+#include <mutex>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include <imgui.h>
@@ -20,9 +25,33 @@
 extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam);
 #define WM_TRAYICON (WM_USER + 100)
 LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
-    if(ImGui_ImplWin32_WndProcHandler) {
-
+    if(ImGui_ImplWin32_WndProcHandler(hWnd, msg, wParam, lParam)) {
+        return true;
     }
+    switch(msg) {
+        case WM_TRAYICON: {
+            switch(LOWORD(lParam)) {
+				case WM_LBUTTONUP:
+                    ShowWindow(hWnd, SW_SHOW); // 从托盘恢复主窗口
+                    SetForegroundWindow(hWnd);
+                    break;
+                case WM_RBUTTONUP: {
+                    POINT pt; GetCursorPos(&pt);
+                    HMENU hMenu = CreatePopupMenu();
+                    AppendMenu(hMenu, MF_STRING, 1001, L"退出");
+                    SetForegroundWindow(hWnd); // 确保菜单能正确显示
+                    TrackPopupMenu(hMenu, TPM_RIGHTBUTTON, pt.x, pt.y, 0, hWnd, NULL);
+                    DestroyMenu(hMenu);
+                    break;
+                }  
+            }
+            return 0;
+        }
+		case WM_CLOSE:
+			ShowWindow(hWnd, SW_HIDE); // 隐藏主窗口到托盘
+			return 0;
+    }
+    return DefWindowProc(hWnd, msg, wParam, lParam);
 }
 #endif
 
@@ -128,6 +157,45 @@ namespace {
         }
         return people;
     }
+
+    // 采集线程写入、推理线程和主线程读取的最新画面，深度固定为 1，新帧直接覆盖旧帧。
+    struct FrameBuffer {
+        std::mutex mutex;
+        std::condition_variable updated;
+        cv::Mat frame;
+        std::uint64_t sequence = 0;
+        bool running = true;
+    };
+
+    // 推理线程输出的检测结果，主线程每帧取一次快照。
+    struct DetectionOutput {
+        std::mutex mutex;
+        std::vector<cv::Rect> people;
+        std::vector<std::vector<cv::Rect>> faces;
+        float processingMilliseconds = 0.0f;
+        bool enabled = true;
+    };
+
+    // 推理线程使用的参数快照，避免直接读取正在被界面修改的 Settings。
+    struct DetectionParams {
+        bool enabled = true;
+        float confidenceThreshold = 0.4f;
+        float nmsThreshold = 0.45f;
+        int faceMinNeighbors = 3;
+        int detectionIntervalFrames = 2;
+    };
+
+    // 抓拍任务和抓拍结果，由抓拍线程异步处理。
+    struct CaptureWorker {
+        std::mutex mutex;
+        std::condition_variable ready;
+        cv::Mat frame;
+        std::filesystem::path outputDirectory;
+        std::string message;
+        bool hasRequest = false;
+        bool hasMessage = false;
+        bool running = true;
+    };
 }
 
 
@@ -171,8 +239,9 @@ int main(int argc, char * argv[]) {
         return showStartupError("Haar face model file not found: " + faceModelPath.string());
     }
 
-    // 限制 OpenCV CPU 线程数，避免 DNN 与预览渲染争抢所有核心。
-    cv::setNumThreads(2);
+    // 推理线程独占 OpenCV 线程池，留一个核心给采集和界面线程。
+    const unsigned int hardwareThreads = std::thread::hardware_concurrency();
+    cv::setNumThreads(hardwareThreads > 2 ? static_cast<int>(hardwareThreads - 1) : 2);
 
     // 加载 YOLO 人体检测模型；加载失败时输出原因并退出。
     cv::dnn::Net personDetector;
@@ -207,56 +276,87 @@ int main(int argc, char * argv[]) {
     status.message = "检测已就绪";
 
     const std::filesystem::path outputDirectory("captures");
-    auto lastCapture = std::chrono::steady_clock::time_point{};
-    auto previousFrameTime = std::chrono::steady_clock::time_point{};
-    bool hasCaptured = false;
-    bool previousPerformanceMode = settings.performanceMode;
-    int frameIndex = 0;
-    std::vector<cv::Rect> cachedPeople;
-    std::vector<std::vector<cv::Rect>> cachedFaces;
-    cv::Mat frame;
 
-    // 在 ImGui 窗口消息循环中采集画面、检测并刷新调试界面。
-    while(ImGuiUI::ProcessMessages()) {
-        if(!camera.read(frame)) {
-            status.cameraReady = false;
-            status.message = "摄像头读取失败";
-            std::cerr << status.message << std::endl;
-            break;
+    // 三线程流水线共享的状态：画面缓冲、检测结果、推理参数和抓拍任务。
+    FrameBuffer frameBuffer;
+    DetectionOutput detectionOutput;
+    CaptureWorker captureWorker;
+    std::mutex paramsMutex;
+    DetectionParams detectionParams;
+
+    std::atomic<bool> captureRunning(true);
+    std::atomic<bool> cameraFailed(false);
+    std::atomic<bool> cameraSettingsChanged(false);
+    std::atomic<int> requestedWidth(640);
+    std::atomic<int> requestedHeight(480);
+
+    // 采集线程独占摄像头，只负责把最新画面写入深度为 1 的缓冲。
+    std::thread captureThread([&]() {
+        while(captureRunning.load()) {
+            if(cameraSettingsChanged.exchange(false)) {
+                camera.set(cv::CAP_PROP_FRAME_WIDTH, requestedWidth.load());
+                camera.set(cv::CAP_PROP_FRAME_HEIGHT, requestedHeight.load());
+            }
+
+            // 每帧重新分配像素，避免覆盖推理线程和主线程仍在引用的画面。
+            cv::Mat captured;
+            if(!camera.read(captured) || captured.empty()) {
+                cameraFailed = true;
+                break;
+            }
+
+            {
+                std::lock_guard<std::mutex> lock(frameBuffer.mutex);
+                frameBuffer.frame = captured;
+                ++frameBuffer.sequence;
+            }
+            frameBuffer.updated.notify_all();
         }
-        if(frame.empty()) {
-            continue;
+
+        {
+            std::lock_guard<std::mutex> lock(frameBuffer.mutex);
+            frameBuffer.running = false;
         }
+        frameBuffer.updated.notify_all();
+    });
 
-        const auto frameStart = std::chrono::steady_clock::now();
-        const bool performanceModeChanged = previousPerformanceMode != settings.performanceMode;
-        if(performanceModeChanged) {
-            const double targetWidth = settings.performanceMode ? 640.0 : 1280.0;
-            const double targetHeight = settings.performanceMode ? 480.0 : 720.0;
-            camera.set(cv::CAP_PROP_FRAME_WIDTH, targetWidth);
-            camera.set(cv::CAP_PROP_FRAME_HEIGHT, targetHeight);
-            previousPerformanceMode = settings.performanceMode;
-        }
+    // 推理线程等待新画面，按间隔运行 YOLO 和 Haar，把结果交给主线程。
+    std::thread inferenceThread([&]() {
+        std::uint64_t lastSequence = 0;
+        std::uint64_t frameIndex = 0;
+        std::vector<cv::Rect> cachedPeople;
+        std::vector<std::vector<cv::Rect>> cachedFaces;
 
-        status.frameWidth = frame.cols;
-        status.frameHeight = frame.rows;
-        cv::Mat displayFrame = frame.clone();
-        bool faceDetected = false;
+        while(true) {
+            cv::Mat frame;
+            {
+                std::unique_lock<std::mutex> lock(frameBuffer.mutex);
+                frameBuffer.updated.wait(lock, [&]() {
+                    return !frameBuffer.running || frameBuffer.sequence != lastSequence;
+                });
+                if(!frameBuffer.running) {
+                    return;
+                }
+                lastSequence = frameBuffer.sequence;
+                frame = frameBuffer.frame;
+            }
 
-        if(!settings.detectionEnabled) {
-            cachedPeople.clear();
-            cachedFaces.clear();
-            status.personCount = 0;
-            status.faceCount = 0;
-        } else {
-            const bool shouldDetect = performanceModeChanged ||
-                frameIndex % settings.detectionIntervalFrames == 0;
-            if(shouldDetect) {
+            DetectionParams params;
+            {
+                std::lock_guard<std::mutex> lock(paramsMutex);
+                params = detectionParams;
+            }
+
+            const auto detectStart = std::chrono::steady_clock::now();
+            if(!params.enabled) {
+                cachedPeople.clear();
+                cachedFaces.clear();
+            } else if(frameIndex % std::max(1, params.detectionIntervalFrames) == 0) {
                 cachedPeople = DetectPeople(
                     personDetector,
                     frame,
-                    settings.confidenceThreshold,
-                    settings.nmsThreshold);
+                    params.confidenceThreshold,
+                    params.nmsThreshold);
                 cachedFaces.clear();
                 cachedFaces.reserve(cachedPeople.size());
                 for(const cv::Rect & person : cachedPeople) {
@@ -265,58 +365,198 @@ int main(int argc, char * argv[]) {
                         person,
                         faceDetector,
                         1.1,
-                        settings.faceMinNeighbors,
+                        params.faceMinNeighbors,
                         cv::Size(30, 30)));
                 }
             }
+            ++frameIndex;
 
-            status.personCount = static_cast<int>(cachedPeople.size());
-            status.faceCount = 0;
-            for(std::size_t index = 0; index < cachedPeople.size(); ++index) {
-                if(settings.drawPeople) {
-                    cv::rectangle(displayFrame, cachedPeople[index], cv::Scalar(255, 180, 0), 2, cv::LINE_AA);
+            const float detectMilliseconds = std::chrono::duration<float, std::milli>(
+                std::chrono::steady_clock::now() - detectStart).count();
+            std::lock_guard<std::mutex> lock(detectionOutput.mutex);
+            detectionOutput.people = cachedPeople;
+            detectionOutput.faces = cachedFaces;
+            detectionOutput.enabled = params.enabled;
+            detectionOutput.processingMilliseconds = detectMilliseconds;
+        }
+    });
+
+    // 抓拍线程负责截屏和写盘，抓拍时界面不再卡顿。
+    std::thread captureWorkerThread([&]() {
+        while(true) {
+            cv::Mat requestFrame;
+            std::filesystem::path requestDirectory;
+            {
+                std::unique_lock<std::mutex> lock(captureWorker.mutex);
+                captureWorker.ready.wait(lock, [&]() {
+                    return !captureWorker.running || captureWorker.hasRequest;
+                });
+                if(!captureWorker.running) {
+                    return;
                 }
-                const std::vector<cv::Rect> & faces = cachedFaces[index];
-                status.faceCount += static_cast<int>(faces.size());
-                if(!faces.empty()) {
+                requestFrame = captureWorker.frame;
+                requestDirectory = captureWorker.outputDirectory;
+                captureWorker.frame.release();
+                captureWorker.hasRequest = false;
+            }
+
+            const FaceCapture::CaptureResult result =
+                FaceCapture::CaptureFaceEvent(requestFrame, requestDirectory);
+
+            std::lock_guard<std::mutex> lock(captureWorker.mutex);
+            captureWorker.message = result.succeeded()
+                ? "摄像头画面和桌面截图均已保存"
+                : "抓拍失败：摄像头 " + std::string(result.cameraSaved ? "成功" : "失败") +
+                    "，桌面 " + (result.desktopSaved ? "成功" : "失败");
+            captureWorker.hasMessage = true;
+        }
+    });
+
+    auto lastCapture = std::chrono::steady_clock::time_point{};
+    auto previousFrameTime = std::chrono::steady_clock::time_point{};
+    bool hasCaptured = false;
+    bool previousPerformanceMode = settings.performanceMode;
+
+    // 主线程只做界面渲染和画框，检测与抓拍都在后台线程完成。
+    while(ImGuiUI::ProcessMessages()) {
+        const auto loopStart = std::chrono::steady_clock::now();
+        if(cameraFailed.load()) {
+            status.cameraReady = false;
+            status.message = "摄像头读取失败";
+            std::cerr << status.message << std::endl;
+            break;
+        }
+
+        // 把界面上的检测参数同步给推理线程。
+        {
+            std::lock_guard<std::mutex> lock(paramsMutex);
+            detectionParams.enabled = settings.detectionEnabled;
+            detectionParams.confidenceThreshold = settings.confidenceThreshold;
+            detectionParams.nmsThreshold = settings.nmsThreshold;
+            detectionParams.faceMinNeighbors = settings.faceMinNeighbors;
+            detectionParams.detectionIntervalFrames = settings.detectionIntervalFrames;
+        }
+
+        if(previousPerformanceMode != settings.performanceMode) {
+            requestedWidth = settings.performanceMode ? 640 : 1280;
+            requestedHeight = settings.performanceMode ? 480 : 720;
+            cameraSettingsChanged = true;
+            previousPerformanceMode = settings.performanceMode;
+        }
+
+        cv::Mat frame;
+        {
+            std::lock_guard<std::mutex> lock(frameBuffer.mutex);
+            frame = frameBuffer.frame;
+        }
+        status.frameWidth = frame.cols;
+        status.frameHeight = frame.rows;
+
+        std::vector<cv::Rect> people;
+        std::vector<std::vector<cv::Rect>> faces;
+        bool detectionActive = false;
+        {
+            std::lock_guard<std::mutex> lock(detectionOutput.mutex);
+            people = detectionOutput.people;
+            faces = detectionOutput.faces;
+            detectionActive = detectionOutput.enabled;
+            status.processingMilliseconds = detectionOutput.processingMilliseconds;
+        }
+
+        cv::Mat displayFrame = frame.empty() ? frame : frame.clone();
+        bool faceDetected = false;
+
+        status.personCount = detectionActive ? static_cast<int>(people.size()) : 0;
+        status.faceCount = 0;
+        if(detectionActive) {
+            for(std::size_t index = 0; index < people.size(); ++index) {
+                if(settings.drawPeople) {
+                    cv::rectangle(displayFrame, people[index], cv::Scalar(255, 180, 0), 2, cv::LINE_AA);
+                }
+                if(index >= faces.size()) {
+                    continue;
+                }
+                const std::vector<cv::Rect> & personFaces = faces[index];
+                status.faceCount += static_cast<int>(personFaces.size());
+                if(!personFaces.empty()) {
                     faceDetected = true;
                     if(settings.drawFaces) {
-                        FaceDetetction::DrawFaces(displayFrame, faces);
+                        FaceDetetction::DrawFaces(displayFrame, personFaces);
                     }
                 }
             }
         }
-        ++frameIndex;
 
         const auto now = std::chrono::steady_clock::now();
         const bool intervalElapsed = !hasCaptured ||
             now - lastCapture >= std::chrono::seconds(settings.captureIntervalSeconds);
-        if(settings.captureEnabled &&
-            settings.autoCapture &&
-            faceDetected &&
-            intervalElapsed) {
-            const FaceCapture::CaptureResult result =
-                FaceCapture::CaptureFaceEvent(settings.captureWithBoxes ? displayFrame : frame, outputDirectory);
-            lastCapture = now;
-            hasCaptured = true;
-            status.captureMessage = result.succeeded()
-                ? "摄像头画面和桌面截图均已保存"
-                : "抓拍失败：摄像头 " + std::string(result.cameraSaved ? "成功" : "失败") +
-                    "，桌面 " + (result.desktopSaved ? "成功" : "失败");
-            std::cout << status.captureMessage << std::endl;
+        if(settings.captureEnabled && settings.autoCapture && faceDetected && intervalElapsed) {
+            bool requestQueued = false;
+            {
+                std::lock_guard<std::mutex> lock(captureWorker.mutex);
+                if(!captureWorker.hasRequest) {
+                    captureWorker.frame = settings.captureWithBoxes ? displayFrame : frame;
+                    captureWorker.outputDirectory = outputDirectory;
+                    captureWorker.hasRequest = true;
+                    requestQueued = true;
+                }
+            }
+            if(requestQueued) {
+                captureWorker.ready.notify_one();
+                lastCapture = now;
+                hasCaptured = true;
+            }
         }
 
-        const auto frameEnd = std::chrono::steady_clock::now();
-        status.processingMilliseconds = std::chrono::duration<float, std::milli>(
-            frameEnd - frameStart).count();
+        {
+            std::lock_guard<std::mutex> lock(captureWorker.mutex);
+            if(captureWorker.hasMessage) {
+                status.captureMessage = captureWorker.message;
+                captureWorker.hasMessage = false;
+                std::cout << status.captureMessage << std::endl;
+            }
+        }
+
+        const auto renderEnd = std::chrono::steady_clock::now();
         if(previousFrameTime != std::chrono::steady_clock::time_point{}) {
             const float frameSeconds = std::chrono::duration<float>(
-                frameEnd - previousFrameTime).count();
+                renderEnd - previousFrameTime).count();
             status.framesPerSecond = frameSeconds > 0.0f ? 1.0f / frameSeconds : 0.0f;
         }
-        previousFrameTime = frameEnd;
+        previousFrameTime = renderEnd;
 
         ImGuiUI::Render(settings, status, displayFrame);
+
+        // 窗口隐藏到托盘时 Present 不再限速，这里保证主循环不会空转占满 CPU。
+        const float loopMilliseconds = std::chrono::duration<float, std::milli>(
+            std::chrono::steady_clock::now() - loopStart).count();
+        if(loopMilliseconds < 8.0f) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(
+                static_cast<int>(8.0f - loopMilliseconds) + 1));
+        }
+    }
+
+    // 依次停止采集、推理和抓拍线程，再释放摄像头和界面资源。
+    captureRunning = false;
+    {
+        std::lock_guard<std::mutex> lock(frameBuffer.mutex);
+        frameBuffer.running = false;
+    }
+    frameBuffer.updated.notify_all();
+    if(captureThread.joinable()) {
+        captureThread.join();
+    }
+    if(inferenceThread.joinable()) {
+        inferenceThread.join();
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(captureWorker.mutex);
+        captureWorker.running = false;
+    }
+    captureWorker.ready.notify_all();
+    if(captureWorkerThread.joinable()) {
+        captureWorkerThread.join();
     }
 
     camera.release();

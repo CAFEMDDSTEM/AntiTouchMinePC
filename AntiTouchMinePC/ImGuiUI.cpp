@@ -325,7 +325,7 @@ namespace ImGuiUI {
 			status.cameraReady ? "已连接" : "未连接",
 			status.frameWidth,
 			status.frameHeight);
-		ImGui::Text("FPS：%.1f    单帧耗时：%.1f ms",
+		ImGui::Text("界面 FPS：%.1f    推理耗时：%.1f ms",
 			status.framesPerSecond,
 			status.processingMilliseconds);
 		ImGui::Text("检测到人物：%d    人脸：%d", status.personCount, status.faceCount);
