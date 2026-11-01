@@ -262,15 +262,28 @@ int main(int argc, char * argv[]) {
         return showStartupError("Failed to load Haar face model: " + faceModelPath.string());
     }
 
-    cv::VideoCapture camera(cameraIndex);
-    if(!camera.isOpened()) {
+    cv::VideoCapture camera;
+
+    // MSMF 无法在推流过程中切换分辨率，必须释放后带着分辨率参数重新打开；
+    // 同时 CAP_PROP_BUFFERSIZE 不能放进 open 的参数表，否则连分辨率参数一起被忽略。
+    const auto openCamera = [&](int width, int height) {
+        try {
+            camera.release();
+            if(!camera.open(cameraIndex, cv::CAP_ANY, {
+                    cv::CAP_PROP_FRAME_WIDTH, width,
+                    cv::CAP_PROP_FRAME_HEIGHT, height})) {
+                return false;
+            }
+            camera.set(cv::CAP_PROP_BUFFERSIZE, 1);
+        } catch(const cv::Exception &) {
+            return false;
+        }
+        return true;
+    };
+
+    if(!openCamera(640, 480)) {
         return showStartupError("Could not open camera " + std::to_string(cameraIndex));
     }
-
-    // 降低采集分辨率并限制摄像头缓冲，减少每帧推理量和画面延迟。
-    camera.set(cv::CAP_PROP_FRAME_WIDTH, 640);
-    camera.set(cv::CAP_PROP_FRAME_HEIGHT, 480);
-    camera.set(cv::CAP_PROP_BUFFERSIZE, 1);
 
     status.cameraReady = true;
     status.message = "检测已就绪";
@@ -287,30 +300,57 @@ int main(int argc, char * argv[]) {
     std::atomic<bool> captureRunning(true);
     std::atomic<bool> cameraFailed(false);
     std::atomic<bool> cameraSettingsChanged(false);
+    std::atomic<bool> resolutionFallback(false);
     std::atomic<int> requestedWidth(640);
     std::atomic<int> requestedHeight(480);
 
     // 采集线程独占摄像头，只负责把最新画面写入深度为 1 的缓冲。
     std::thread captureThread([&]() {
-        while(captureRunning.load()) {
-            if(cameraSettingsChanged.exchange(false)) {
-                camera.set(cv::CAP_PROP_FRAME_WIDTH, requestedWidth.load());
-                camera.set(cv::CAP_PROP_FRAME_HEIGHT, requestedHeight.load());
-            }
+        try {
+            int consecutiveFailures = 0;
+            while(captureRunning.load()) {
+                if(cameraSettingsChanged.exchange(false)) {
+                    const int width = requestedWidth.load();
+                    const int height = requestedHeight.load();
+                    // 驱动不支持请求的分辨率时退回 640x480，而不是直接判定摄像头失效。
+                    if(!openCamera(width, height)) {
+                        resolutionFallback = true;
+                        if(!openCamera(640, 480)) {
+                            cameraFailed = true;
+                            break;
+                        }
+                    }
+                }
 
-            // 每帧重新分配像素，避免覆盖推理线程和主线程仍在引用的画面。
-            cv::Mat captured;
-            if(!camera.read(captured) || captured.empty()) {
-                cameraFailed = true;
-                break;
-            }
+                // 每帧重新分配像素，避免覆盖推理线程和主线程仍在引用的画面。
+                cv::Mat captured;
+                bool readSucceeded = false;
+                try {
+                    readSucceeded = camera.read(captured) && !captured.empty();
+                } catch(const cv::Exception &) {
+                    readSucceeded = false;
+                }
 
-            {
-                std::lock_guard<std::mutex> lock(frameBuffer.mutex);
-                frameBuffer.frame = captured;
-                ++frameBuffer.sequence;
+                if(!readSucceeded) {
+                    // 数据流可能已被驱动破坏，重开一次再继续；连续失败才放弃。
+                    if(++consecutiveFailures > 3 || !openCamera(requestedWidth.load(), requestedHeight.load())) {
+                        cameraFailed = true;
+                        break;
+                    }
+                    continue;
+                }
+                consecutiveFailures = 0;
+
+                {
+                    std::lock_guard<std::mutex> lock(frameBuffer.mutex);
+                    frameBuffer.frame = captured;
+                    ++frameBuffer.sequence;
+                }
+                frameBuffer.updated.notify_all();
             }
-            frameBuffer.updated.notify_all();
+        } catch(const std::exception & error) {
+            std::cerr << "采集线程异常：" << error.what() << std::endl;
+            cameraFailed = true;
         }
 
         {
@@ -352,21 +392,28 @@ int main(int argc, char * argv[]) {
                 cachedPeople.clear();
                 cachedFaces.clear();
             } else if(frameIndex % std::max(1, params.detectionIntervalFrames) == 0) {
-                cachedPeople = DetectPeople(
-                    personDetector,
-                    frame,
-                    params.confidenceThreshold,
-                    params.nmsThreshold);
-                cachedFaces.clear();
-                cachedFaces.reserve(cachedPeople.size());
-                for(const cv::Rect & person : cachedPeople) {
-                    cachedFaces.push_back(FaceDetetction::DetectFacesInPerson(
+                try {
+                    cachedPeople = DetectPeople(
+                        personDetector,
                         frame,
-                        person,
-                        faceDetector,
-                        1.1,
-                        params.faceMinNeighbors,
-                        cv::Size(30, 30)));
+                        params.confidenceThreshold,
+                        params.nmsThreshold);
+                    cachedFaces.clear();
+                    cachedFaces.reserve(cachedPeople.size());
+                    for(const cv::Rect & person : cachedPeople) {
+                        cachedFaces.push_back(FaceDetetction::DetectFacesInPerson(
+                            frame,
+                            person,
+                            faceDetector,
+                            1.1,
+                            params.faceMinNeighbors,
+                            cv::Size(30, 30)));
+                    }
+                } catch(const std::exception & error) {
+                    // 单帧检测失败不能拖垮整个程序，清空结果后继续处理下一帧。
+                    std::cerr << "检测异常：" << error.what() << std::endl;
+                    cachedPeople.clear();
+                    cachedFaces.clear();
                 }
             }
             ++frameIndex;
@@ -400,14 +447,20 @@ int main(int argc, char * argv[]) {
                 captureWorker.hasRequest = false;
             }
 
-            const FaceCapture::CaptureResult result =
-                FaceCapture::CaptureFaceEvent(requestFrame, requestDirectory);
+            std::string message;
+            try {
+                const FaceCapture::CaptureResult result =
+                    FaceCapture::CaptureFaceEvent(requestFrame, requestDirectory);
+                message = result.succeeded()
+                    ? "摄像头画面和桌面截图均已保存"
+                    : "抓拍失败：摄像头 " + std::string(result.cameraSaved ? "成功" : "失败") +
+                        "，桌面 " + (result.desktopSaved ? "成功" : "失败");
+            } catch(const std::exception & error) {
+                message = std::string("抓拍异常：") + error.what();
+            }
 
             std::lock_guard<std::mutex> lock(captureWorker.mutex);
-            captureWorker.message = result.succeeded()
-                ? "摄像头画面和桌面截图均已保存"
-                : "抓拍失败：摄像头 " + std::string(result.cameraSaved ? "成功" : "失败") +
-                    "，桌面 " + (result.desktopSaved ? "成功" : "失败");
+            captureWorker.message = message;
             captureWorker.hasMessage = true;
         }
     });
@@ -442,6 +495,11 @@ int main(int argc, char * argv[]) {
             requestedHeight = settings.performanceMode ? 480 : 720;
             cameraSettingsChanged = true;
             previousPerformanceMode = settings.performanceMode;
+        }
+
+        if(resolutionFallback.exchange(false)) {
+            status.message = "摄像头不支持所选分辨率，已回退到 640x480";
+            std::cerr << status.message << std::endl;
         }
 
         cv::Mat frame;
