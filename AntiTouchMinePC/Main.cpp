@@ -19,42 +19,6 @@
 #include <thread>
 #include <vector>
 
-#include <imgui.h>
-
-#ifdef _WIN32
-extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam);
-#define WM_TRAYICON (WM_USER + 100)
-LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
-    if(ImGui_ImplWin32_WndProcHandler(hWnd, msg, wParam, lParam)) {
-        return true;
-    }
-    switch(msg) {
-        case WM_TRAYICON: {
-            switch(LOWORD(lParam)) {
-				case WM_LBUTTONUP:
-                    ShowWindow(hWnd, SW_SHOW); // 从托盘恢复主窗口
-                    SetForegroundWindow(hWnd);
-                    break;
-                case WM_RBUTTONUP: {
-                    POINT pt; GetCursorPos(&pt);
-                    HMENU hMenu = CreatePopupMenu();
-                    AppendMenu(hMenu, MF_STRING, 1001, L"退出");
-                    SetForegroundWindow(hWnd); // 确保菜单能正确显示
-                    TrackPopupMenu(hMenu, TPM_RIGHTBUTTON, pt.x, pt.y, 0, hWnd, NULL);
-                    DestroyMenu(hMenu);
-                    break;
-                }  
-            }
-            return 0;
-        }
-		case WM_CLOSE:
-			ShowWindow(hWnd, SW_HIDE); // 隐藏主窗口到托盘
-			return 0;
-    }
-    return DefWindowProc(hWnd, msg, wParam, lParam);
-}
-#endif
-
 namespace {
     // YOLOv5n 的输入尺寸、COCO 人类别编号和检测阈值。
     constexpr int modelInputSize = 640;

@@ -16,6 +16,7 @@ namespace ImGuiUI {
 		bool captureWithBoxes = true;
 		bool autoCapture = true;
 		bool performanceMode = true;
+		bool closeToTray = true;
 		float confidenceThreshold = 0.4f;
 		float nmsThreshold = 0.45f;
 		int faceMinNeighbors = 3;
