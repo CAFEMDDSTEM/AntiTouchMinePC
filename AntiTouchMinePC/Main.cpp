@@ -27,7 +27,9 @@ namespace {
     // 将模型输出转换为原始画面中的人物矩形框。
     std::vector<cv::Rect> DetectPeople(
         cv::dnn::Net & detector,
+        const std::vector<std::string> & outputLayerNames,
         const cv::Mat & frame,
+        cv::Mat & blob,
         float confidenceThreshold,
         float nmsThreshold) {
         std::vector<cv::Rect> people;
@@ -36,7 +38,6 @@ namespace {
         }
 
         // 缩放并归一化输入画面，转换成 YOLO 所需的 NCHW 张量。
-        cv::Mat blob;
         cv::dnn::blobFromImage(
             frame,
             blob,
@@ -48,7 +49,7 @@ namespace {
         detector.setInput(blob);
 
         std::vector<cv::Mat> outputs;
-        detector.forward(outputs, detector.getUnconnectedOutLayersNames());
+        detector.forward(outputs, outputLayerNames);
         if(outputs.empty()) {
             return people;
         }
@@ -203,9 +204,12 @@ int main(int argc, char * argv[]) {
         return showStartupError("Haar face model file not found: " + faceModelPath.string());
     }
 
-    // 推理线程独占 OpenCV 线程池，留一个核心给采集和界面线程。
+    // 控制 OpenCV 并行度，避免 DNN 占满 CPU 后拖慢界面和摄像头采集。
     const unsigned int hardwareThreads = std::thread::hardware_concurrency();
-    cv::setNumThreads(hardwareThreads > 2 ? static_cast<int>(hardwareThreads - 1) : 2);
+    const int detectionThreads = hardwareThreads == 0
+        ? 2
+        : static_cast<int>(std::clamp(hardwareThreads > 1 ? hardwareThreads - 1 : 1, 1u, 4u));
+    cv::setNumThreads(detectionThreads);
 
     // 加载 YOLO 人体检测模型；加载失败时输出原因并退出。
     cv::dnn::Net personDetector;
@@ -219,6 +223,8 @@ int main(int argc, char * argv[]) {
     }
     personDetector.setPreferableBackend(cv::dnn::DNN_BACKEND_OPENCV);
     personDetector.setPreferableTarget(cv::dnn::DNN_TARGET_CPU);
+    const std::vector<std::string> personOutputLayerNames =
+        personDetector.getUnconnectedOutLayersNames();
 
     // 加载 Haar 分类器，用于在人框区域内进一步检测人脸。
     cv::CascadeClassifier faceDetector;
@@ -263,6 +269,7 @@ int main(int argc, char * argv[]) {
 
     std::atomic<bool> captureRunning(true);
     std::atomic<bool> cameraFailed(false);
+    std::atomic<bool> cameraConnected(true);
     std::atomic<bool> cameraSettingsChanged(false);
     std::atomic<bool> resolutionFallback(false);
     std::atomic<int> requestedWidth(640);
@@ -272,7 +279,31 @@ int main(int argc, char * argv[]) {
     std::thread captureThread([&]() {
         try {
             int consecutiveFailures = 0;
+            const auto retryDelay = [&]() {
+                const int exponent = std::min(consecutiveFailures, 4);
+                std::this_thread::sleep_for(std::chrono::milliseconds(100 * (1 << exponent)));
+            };
             while(captureRunning.load()) {
+                if(!camera.isOpened()) {
+                    const int width = requestedWidth.load();
+                    const int height = requestedHeight.load();
+                    bool opened = openCamera(width, height);
+                    if(!opened && (width != 640 || height != 480)) {
+                        opened = openCamera(640, 480);
+                        if(opened) {
+                            resolutionFallback = true;
+                        }
+                    }
+                    if(!opened) {
+                        cameraConnected = false;
+                        ++consecutiveFailures;
+                        retryDelay();
+                        continue;
+                    }
+                    cameraConnected = true;
+                    consecutiveFailures = 0;
+                }
+
                 if(cameraSettingsChanged.exchange(false)) {
                     const int width = requestedWidth.load();
                     const int height = requestedHeight.load();
@@ -280,10 +311,20 @@ int main(int argc, char * argv[]) {
                     if(!openCamera(width, height)) {
                         resolutionFallback = true;
                         if(!openCamera(640, 480)) {
-                            cameraFailed = true;
-                            break;
+                            cameraConnected = false;
+                            {
+                                std::lock_guard<std::mutex> lock(frameBuffer.mutex);
+                                frameBuffer.frame.release();
+                                ++frameBuffer.sequence;
+                            }
+                            frameBuffer.updated.notify_all();
+                            ++consecutiveFailures;
+                            retryDelay();
+                            continue;
                         }
                     }
+                    cameraConnected = true;
+                    consecutiveFailures = 0;
                 }
 
                 // 每帧重新分配像素，避免覆盖推理线程和主线程仍在引用的画面。
@@ -296,13 +337,19 @@ int main(int argc, char * argv[]) {
                 }
 
                 if(!readSucceeded) {
-                    // 数据流可能已被驱动破坏，重开一次再继续；连续失败才放弃。
-                    if(++consecutiveFailures > 3 || !openCamera(requestedWidth.load(), requestedHeight.load())) {
-                        cameraFailed = true;
-                        break;
+                    cameraConnected = false;
+                    camera.release();
+                    {
+                        std::lock_guard<std::mutex> lock(frameBuffer.mutex);
+                        frameBuffer.frame.release();
+                        ++frameBuffer.sequence;
                     }
+                    frameBuffer.updated.notify_all();
+                    ++consecutiveFailures;
+                    retryDelay();
                     continue;
                 }
+                cameraConnected = true;
                 consecutiveFailures = 0;
 
                 {
@@ -328,6 +375,7 @@ int main(int argc, char * argv[]) {
     std::thread inferenceThread([&]() {
         std::uint64_t lastSequence = 0;
         std::uint64_t frameIndex = 0;
+        cv::Mat personBlob;
         std::vector<cv::Rect> cachedPeople;
         std::vector<std::vector<cv::Rect>> cachedFaces;
 
@@ -359,7 +407,9 @@ int main(int argc, char * argv[]) {
                 try {
                     cachedPeople = DetectPeople(
                         personDetector,
+                        personOutputLayerNames,
                         frame,
+                        personBlob,
                         params.confidenceThreshold,
                         params.nmsThreshold);
                     cachedFaces.clear();
@@ -439,9 +489,17 @@ int main(int argc, char * argv[]) {
         const auto loopStart = std::chrono::steady_clock::now();
         if(cameraFailed.load()) {
             status.cameraReady = false;
-            status.message = "摄像头读取失败";
+            status.message = "摄像头采集线程异常";
             std::cerr << status.message << std::endl;
             break;
+        }
+        status.cameraReady = cameraConnected.load();
+        if(status.cameraReady) {
+            if(status.message == "摄像头断开，正在重连...") {
+                status.message = "检测已就绪";
+            }
+        } else {
+            status.message = "摄像头断开，正在重连...";
         }
 
         // 把界面上的检测参数同步给推理线程。
@@ -509,10 +567,14 @@ int main(int argc, char * argv[]) {
             }
         }
 
+        const bool captureTargetDetected = settings.captureTarget == ImGuiUI::CaptureTarget::Face
+            ? faceDetected
+            : detectionActive && !people.empty();
         const auto now = std::chrono::steady_clock::now();
         const bool intervalElapsed = !hasCaptured ||
             now - lastCapture >= std::chrono::seconds(settings.captureIntervalSeconds);
-        if(settings.captureEnabled && settings.autoCapture && faceDetected && intervalElapsed) {
+        if(settings.captureEnabled && settings.autoCapture &&
+            captureTargetDetected && intervalElapsed) {
             bool requestQueued = false;
             {
                 std::lock_guard<std::mutex> lock(captureWorker.mutex);

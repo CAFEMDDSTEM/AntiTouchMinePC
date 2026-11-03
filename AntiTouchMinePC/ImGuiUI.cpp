@@ -182,6 +182,19 @@ namespace {
 		}
 	}
 
+	bool PublishPhotoLoaderResult(
+		const std::vector<PhotoThumbnailData> & photos,
+		const std::string & errorMessage) {
+		std::unique_lock<std::mutex> lock(photoLoader.mutex);
+		photoLoader.result = photos;
+		photoLoader.error = errorMessage;
+		photoLoader.resultReady = true;
+		photoLoader.resultConsumed.wait(lock, []() {
+			return !photoLoader.running || !photoLoader.resultReady;
+		});
+		return photoLoader.running;
+	}
+
 	void PhotoLoaderThread() {
 		std::unordered_map<std::string, CachedPhoto> cache;
 		while(true) {
@@ -273,19 +286,11 @@ namespace {
 				errorMessage = std::string("加载照片列表失败：") + error.what();
 			}
 
-			{
-				std::unique_lock<std::mutex> lock(photoLoader.mutex);
-				photoLoader.result = refreshed;
-				photoLoader.error = errorMessage;
-				photoLoader.resultReady = true;
-				photoLoader.resultConsumed.wait(lock, []() {
-					return !photoLoader.running || !photoLoader.resultReady;
-				});
-				if(!photoLoader.running) {
-					return;
-				}
+			if(!PublishPhotoLoaderResult(refreshed, errorMessage)) {
+				return;
 			}
 
+			std::size_t decodedSincePublish = 0;
 			for(PhotoThumbnailData & photo : refreshed) {
 				if(!photo.pixels.empty()) {
 					continue;
@@ -294,14 +299,21 @@ namespace {
 				if(cached != cache.end()) {
 					cached->second.photo = LoadPhotoThumbnailData(photo.path);
 					photo = cached->second.photo;
+					++decodedSincePublish;
 				}
+				if(decodedSincePublish >= 8) {
+					if(!PublishPhotoLoaderResult(refreshed, errorMessage)) {
+						return;
+					}
+					decodedSincePublish = 0;
+				}
+			}
+			if(decodedSincePublish > 0 && !PublishPhotoLoaderResult(refreshed, errorMessage)) {
+				return;
 			}
 
 			{
 				std::lock_guard<std::mutex> lock(photoLoader.mutex);
-				photoLoader.result = std::move(refreshed);
-				photoLoader.error = std::move(errorMessage);
-				photoLoader.resultReady = true;
 				photoLoader.busy = false;
 			}
 		}
@@ -488,6 +500,59 @@ namespace {
 		}
 	}
 
+	bool UpdatePreviewTexture(const cv::Mat & frame) {
+		if(frame.empty()) {
+			return false;
+		}
+
+		cv::Mat bgraFrame;
+		if(frame.channels() == 3) {
+			cv::cvtColor(frame, bgraFrame, cv::COLOR_BGR2BGRA);
+		} else if(frame.channels() == 4) {
+			bgraFrame = frame;
+		} else if(frame.channels() == 1) {
+			cv::cvtColor(frame, bgraFrame, cv::COLOR_GRAY2BGRA);
+		} else {
+			return false;
+		}
+
+		if(previewTexture != nullptr) {
+			D3D11_TEXTURE2D_DESC currentDescription{};
+			previewTexture->GetDesc(&currentDescription);
+			if(currentDescription.Width != static_cast<UINT>(bgraFrame.cols) ||
+				currentDescription.Height != static_cast<UINT>(bgraFrame.rows)) {
+				CleanupPreviewTexture();
+			}
+		}
+
+		if(previewTexture == nullptr) {
+			D3D11_TEXTURE2D_DESC textureDescription{};
+			textureDescription.Width = static_cast<UINT>(bgraFrame.cols);
+			textureDescription.Height = static_cast<UINT>(bgraFrame.rows);
+			textureDescription.MipLevels = 1;
+			textureDescription.ArraySize = 1;
+			textureDescription.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+			textureDescription.SampleDesc.Count = 1;
+			textureDescription.Usage = D3D11_USAGE_DEFAULT;
+			textureDescription.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+			if(FAILED(device->CreateTexture2D(&textureDescription, nullptr, &previewTexture)) ||
+				FAILED(device->CreateShaderResourceView(previewTexture, nullptr, &previewView))) {
+				std::cerr << "Failed to create the ImGui camera preview texture." << std::endl;
+				CleanupPreviewTexture();
+				return false;
+			}
+		}
+
+		deviceContext->UpdateSubresource(
+			previewTexture,
+			0,
+			nullptr,
+			bgraFrame.data,
+			static_cast<UINT>(bgraFrame.step),
+			0);
+		return true;
+	}
+
 	bool CreateDeviceD3D(HWND window) {
 		DXGI_SWAP_CHAIN_DESC swapChainDescription{};
 		swapChainDescription.BufferCount = 2;
@@ -542,56 +607,6 @@ namespace {
 			device->Release();
 			device = nullptr;
 		}
-	}
-
-	bool UpdatePreviewTexture(const cv::Mat & frame) {
-		if(frame.empty()) {
-			return false;
-		}
-
-		cv::Mat bgraFrame;
-		if(frame.channels() == 3) {
-			cv::cvtColor(frame, bgraFrame, cv::COLOR_BGR2BGRA);
-		} else if(frame.channels() == 4) {
-			bgraFrame = frame;
-		} else {
-			return false;
-		}
-
-		if(previewTexture != nullptr) {
-			D3D11_TEXTURE2D_DESC currentDescription{};
-			previewTexture->GetDesc(&currentDescription);
-			if(currentDescription.Width != static_cast<UINT>(bgraFrame.cols) ||
-				currentDescription.Height != static_cast<UINT>(bgraFrame.rows)) {
-				CleanupPreviewTexture();
-			}
-		}
-
-		if(previewTexture == nullptr) {
-			D3D11_TEXTURE2D_DESC textureDescription{};
-			textureDescription.Width = static_cast<UINT>(bgraFrame.cols);
-			textureDescription.Height = static_cast<UINT>(bgraFrame.rows);
-			textureDescription.MipLevels = 1;
-			textureDescription.ArraySize = 1;
-			textureDescription.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
-			textureDescription.SampleDesc.Count = 1;
-			textureDescription.Usage = D3D11_USAGE_DEFAULT;
-			textureDescription.BindFlags = D3D11_BIND_SHADER_RESOURCE;
-			if(FAILED(device->CreateTexture2D(&textureDescription, nullptr, &previewTexture)) ||
-				FAILED(device->CreateShaderResourceView(previewTexture, nullptr, &previewView))) {
-				CleanupPreviewTexture();
-				return false;
-			}
-		}
-
-		deviceContext->UpdateSubresource(
-			previewTexture,
-			0,
-			nullptr,
-			bgraFrame.data,
-			static_cast<UINT>(bgraFrame.step),
-			0);
-		return true;
 	}
 
 	LRESULT WINAPI WindowProcedure(HWND window, UINT message, WPARAM wParam, LPARAM lParam) {
@@ -787,6 +802,7 @@ namespace ImGuiUI {
 		ImGui::Text("检测到人物：%d    人脸：%d", status.personCount, status.faceCount);
 		ImGui::Text("最近抓拍：%s",
 			settings.captureEnabled ? status.captureMessage.c_str() : "抓拍已关闭");
+		ImGui::Checkbox("显示摄像头预览窗口", &settings.cameraPreviewWindow);
 		if(ImGui::Button("打开照片列表")) {
 			photoWindowOpen = true;
 			lastPhotoRefresh = std::chrono::steady_clock::time_point{};
@@ -813,33 +829,47 @@ namespace ImGuiUI {
 			ImGui::Checkbox("启用抓拍（摄像头和桌面）", &settings.captureEnabled);
 			ImGui::BeginDisabled(!settings.captureEnabled);
 			ImGui::Checkbox("抓拍图片绘制检测框", &settings.captureWithBoxes);
-			ImGui::Checkbox("检测到人脸时自动抓拍", &settings.autoCapture);
+			ImGui::Checkbox("启用自动抓拍", &settings.autoCapture);
+			ImGui::TextUnformatted("自动抓拍目标：");
+			ImGui::SameLine();
+			if(ImGui::RadioButton(
+				"人脸",
+				settings.captureTarget == ImGuiUI::CaptureTarget::Face)) {
+				settings.captureTarget = ImGuiUI::CaptureTarget::Face;
+			}
+			ImGui::SameLine();
+			if(ImGui::RadioButton(
+				"人体",
+				settings.captureTarget == ImGuiUI::CaptureTarget::Body)) {
+				settings.captureTarget = ImGuiUI::CaptureTarget::Body;
+			}
 			ImGui::SliderInt("自动抓拍间隔（秒）", &settings.captureIntervalSeconds, 1, 60);
 			ImGui::EndDisabled();
 		}
 
-		if(ImGui::CollapsingHeader("摄像头预览", ImGuiTreeNodeFlags_DefaultOpen)) {
-			const ImVec2 availableSize = ImGui::GetContentRegionAvail();
-			ImGui::BeginChild("CameraPreview", availableSize, ImGuiChildFlags_Borders);
-			if(hasPreview && previewView != nullptr) {
-				const float imageWidth = ImGui::GetContentRegionAvail().x;
-				const float imageHeight = ImGui::GetContentRegionAvail().y;
-				const float aspectRatio = static_cast<float>(cameraFrame.cols) / cameraFrame.rows;
-				float displayWidth = imageWidth;
-				float displayHeight = displayWidth / aspectRatio;
-				if(displayHeight > imageHeight) {
-					displayHeight = imageHeight;
-					displayWidth = displayHeight * aspectRatio;
-				}
-				ImGui::Image(
-					static_cast<ImTextureID>(reinterpret_cast<intptr_t>(previewView)),
-					ImVec2(displayWidth, displayHeight));
-			} else {
-				ImGui::TextUnformatted("等待摄像头画面...");
-			}
-			ImGui::EndChild();
-		}
 		ImGui::End();
+
+		if(settings.cameraPreviewWindow) {
+			ImGui::SetNextWindowSize(ImVec2(640.0f, 420.0f), ImGuiCond_FirstUseEver);
+			if(ImGui::Begin("摄像头预览", &settings.cameraPreviewWindow)) {
+				if(hasPreview && previewView != nullptr) {
+					const ImVec2 availableSize = ImGui::GetContentRegionAvail();
+					const float aspectRatio = static_cast<float>(cameraFrame.cols) / cameraFrame.rows;
+					float displayWidth = availableSize.x;
+					float displayHeight = displayWidth / aspectRatio;
+					if(displayHeight > availableSize.y) {
+						displayHeight = availableSize.y;
+						displayWidth = displayHeight * aspectRatio;
+					}
+					ImGui::Image(
+						static_cast<ImTextureID>(reinterpret_cast<intptr_t>(previewView)),
+						ImVec2(displayWidth, displayHeight));
+				} else {
+					ImGui::TextUnformatted("等待摄像头画面...");
+				}
+			}
+			ImGui::End();
+		}
 
 		if(photoWindowOpen) {
 			RefreshPhotoEntries();
@@ -847,6 +877,9 @@ namespace ImGuiUI {
 			if(ImGui::Begin("照片列表", &photoWindowOpen)) {
 				if(!photoListMessage.empty()) {
 					ImGui::TextWrapped("%s", photoListMessage.c_str());
+				}
+				if(IsPhotoLoaderActive()) {
+					ImGui::Text("正在加载照片，已找到 %d 张。", static_cast<int>(photoEntries.size()));
 				}
 				if(photoEntries.empty() && IsPhotoLoaderActive()) {
 					ImGui::TextUnformatted("正在读取照片...");
@@ -960,11 +993,11 @@ namespace ImGuiUI {
 		if(photoLoader.thread.joinable()) {
 			photoLoader.thread.join();
 		}
-		CleanupPreviewTexture();
 		for(PhotoEntry & entry : photoEntries) {
 			ReleasePhotoEntry(entry);
 		}
 		photoEntries.clear();
+		CleanupPreviewTexture();
 		ImGui_ImplDX11_Shutdown();
 		ImGui_ImplWin32_Shutdown();
 		ImGui::DestroyContext();

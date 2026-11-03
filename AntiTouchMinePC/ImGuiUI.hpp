@@ -8,6 +8,11 @@
 #include <string>
 
 namespace ImGuiUI {
+	enum class CaptureTarget {
+		Face,
+		Body
+	};
+
 	struct Settings {
 		bool detectionEnabled = true;
 		bool drawPeople = true;
@@ -15,8 +20,10 @@ namespace ImGuiUI {
 		bool captureEnabled = false;
 		bool captureWithBoxes = true;
 		bool autoCapture = true;
+		CaptureTarget captureTarget = CaptureTarget::Face;
 		bool performanceMode = true;
 		bool closeToTray = true;
+		bool cameraPreviewWindow = true;
 		float confidenceThreshold = 0.4f;
 		float nmsThreshold = 0.45f;
 		int faceMinNeighbors = 3;
